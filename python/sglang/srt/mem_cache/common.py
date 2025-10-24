@@ -327,6 +327,9 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
+    from sglang.srt.utils import logger
+    logger.info(f"[CHUNKED_PREFILL_DEBUG] alloc_for_extend START: batch_size={len(batch.reqs)}, extend_num_tokens={batch.extend_num_tokens}, prefix_lens={batch.prefix_lens}, extend_lens={batch.extend_lens}")
+    
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
@@ -351,10 +354,13 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
+    logger.info(f"[CHUNKED_PREFILL_DEBUG] alloc_for_extend: Allocating KV cache, page_size={batch.tree_cache.page_size}")
     if batch.tree_cache.page_size == 1:
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] alloc_for_extend: Using alloc_token_slots (page_size=1)")
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] alloc_for_extend: Using paged allocation (page_size={batch.tree_cache.page_size})")
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
@@ -368,6 +374,7 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
+    logger.info(f"[CHUNKED_PREFILL_DEBUG] alloc_for_extend: KV cache allocated successfully, out_cache_loc shape={out_cache_loc.shape}")
 
     # Write to req_to_token_pool
     write_cache_indices(

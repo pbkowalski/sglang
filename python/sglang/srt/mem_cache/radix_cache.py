@@ -512,6 +512,9 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
+        if node is None:
+            return 0
+
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
@@ -524,6 +527,9 @@ class RadixCache(BasePrefixCache):
 
     def dec_lock_ref(self, node: TreeNode):
         if self.disable:
+            return 0
+
+        if node is None:
             return 0
 
         delta = 0

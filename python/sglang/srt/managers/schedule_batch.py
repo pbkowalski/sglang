@@ -1155,11 +1155,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
+        from sglang.srt.utils import logger
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] prepare_for_extend: batch_size={len(self.reqs)}, chunked_req={'YES' if self.chunked_req else 'NO'}")
         self.forward_mode = ForwardMode.EXTEND
 
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] prepare_for_extend input_ids lengths: {[len(ids) for ids in input_ids]}")
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]

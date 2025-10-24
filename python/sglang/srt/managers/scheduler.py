@@ -1580,6 +1580,7 @@ class Scheduler(
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] Processing chunked request: rid={self.chunked_req.rid}, is_chunked={self.chunked_req.is_chunked}, extend_input_len={self.chunked_req.extend_input_len}")
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
@@ -1772,9 +1773,11 @@ class Scheduler(
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] New chunked request created: rid={self.chunked_req.rid}, total_len={len(self.chunked_req.fill_ids)}, extend_input_len={self.chunked_req.extend_input_len}")
 
         if self.chunked_req:
             self.chunked_req.is_chunked += 1
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] Incrementing chunked request counter: rid={self.chunked_req.rid}, is_chunked={self.chunked_req.is_chunked}")
 
         # Print stats
         if self.current_scheduler_metrics_enabled():

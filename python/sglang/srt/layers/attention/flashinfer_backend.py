@@ -400,7 +400,10 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend.init_forward_metadata: forward_mode={forward_batch.forward_mode}, batch_size={forward_batch.batch_size}, seq_lens_sum={forward_batch.seq_lens_sum}")
+        
         if forward_batch.forward_mode.is_decode_or_idle():
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend: Processing DECODE mode")
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -414,6 +417,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend: Processing DRAFT_EXTEND mode")
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -444,7 +448,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_verify, False, False
             )
         else:
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend: Processing EXTEND mode (chunked prefill)")
             prefix_lens = forward_batch.extend_prefix_lens
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend EXTEND: prefix_lens={forward_batch.extend_prefix_lens_cpu}, seq_lens={forward_batch.seq_lens_cpu.tolist()}")
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
@@ -466,6 +472,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend EXTEND: Calling indices_updater_prefill.update, use_ragged={use_ragged}, extend_no_prefix={extend_no_prefix}")
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -479,12 +486,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
             )
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend EXTEND: indices_updater_prefill.update completed")
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
             )
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] FlashinferBackend.init_forward_metadata EXTEND: Complete")
 
     def init_cuda_graph_state(
         self,

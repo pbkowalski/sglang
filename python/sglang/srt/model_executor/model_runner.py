@@ -2136,8 +2136,12 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend START: batch_size={forward_batch.batch_size}, seq_lens={forward_batch.seq_lens.tolist() if hasattr(forward_batch, 'seq_lens') and forward_batch.seq_lens is not None else 'N/A'}")
+        
         if not skip_attn_backend_init:
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend: Initializing attention backend metadata")
             self.attn_backend.init_forward_metadata(forward_batch)
+            logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend: Attention backend metadata initialized")
 
         kwargs = {}
         if self.support_pp:
@@ -2149,14 +2153,18 @@ class ModelRunner:
 
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+                logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend: Using CUDA graph replay")
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
-        return self.model.forward(
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend: Calling model.forward, input_ids shape={forward_batch.input_ids.shape if forward_batch.input_ids is not None else 'N/A'}")
+        result = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        logger.info(f"[CHUNKED_PREFILL_DEBUG] forward_extend END: model.forward completed successfully")
+        return result
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
