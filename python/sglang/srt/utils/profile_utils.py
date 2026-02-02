@@ -2,16 +2,19 @@ import logging
 import os
 import time
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.profile_merger import classify_trace_file
 
 _is_npu = is_npu()
 if _is_npu:
@@ -25,6 +28,9 @@ if _is_npu:
     torch_npu._apply_patches(patches)
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class ProfileManager:
@@ -60,6 +66,7 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        classify_kernels: bool = False,
     ):
         # not supported yet
         assert start_step is None
@@ -80,6 +87,7 @@ class ProfileManager:
             output_dir=output_dir,
             output_prefix=profile_prefix,
             profile_id=profile_id,
+            classify_kernels=classify_kernels,
         )
 
         self.stage_based_trigger.configure(
@@ -119,6 +127,61 @@ class ProfileManager:
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
         self.profiler = None
+
+
+def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
+    forward_mode = batch.forward_mode
+    if forward_mode is None:
+        stage = "unknown"
+    elif forward_mode.is_extend():
+        stage = "prefill"
+    elif forward_mode.is_decode():
+        stage = "decode"
+    elif forward_mode.is_mixed():
+        stage = "mixed"
+    else:
+        stage = forward_mode.name.lower()
+
+    num_ctx_requests = 0
+    num_ctx_tokens = 0
+    num_gen_requests = 0
+    num_gen_tokens = 0
+
+    reqs = batch.reqs or []
+    if forward_mode is not None and forward_mode.is_decode():
+        num_gen_requests = len(reqs)
+        num_gen_tokens = len(reqs)
+    elif forward_mode is not None and forward_mode.is_extend():
+        num_ctx_requests = len(reqs)
+        if batch.extend_num_tokens is not None:
+            num_ctx_tokens = batch.extend_num_tokens
+        else:
+            num_ctx_tokens = sum(req.extend_input_len for req in reqs)
+    elif forward_mode is not None and forward_mode.is_mixed():
+        if batch.decoding_reqs is not None:
+            num_gen_requests = len(batch.decoding_reqs)
+        else:
+            num_gen_requests = sum(1 for req in reqs if len(req.output_ids) > 0)
+        num_ctx_requests = max(len(reqs) - num_gen_requests, 0)
+        if batch.extend_num_tokens is not None:
+            num_ctx_tokens = batch.extend_num_tokens
+        else:
+            num_ctx_tokens = sum(req.extend_input_len for req in reqs)
+        num_gen_tokens = num_gen_requests
+
+    return (
+        f"{stage}_context_{num_ctx_requests}({num_ctx_tokens})_generation_"
+        f"{num_gen_requests}({num_gen_tokens})"
+    )
+
+
+def get_iteration_profile_context(
+    batch: "ScheduleBatch", enabled: bool
+) -> AbstractContextManager:
+    if not enabled:
+        return nullcontext()
+    name = build_iteration_profile_annotation(batch)
+    return record_function(name)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -243,6 +306,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         tp_rank: int,
         cpu_group,
         first_rank_in_node: bool,
+        classify_kernels: bool = False,
     ):
         self.output_dir = output_dir
         self.output_prefix = output_prefix
@@ -251,6 +315,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.tp_rank = tp_rank
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
+        self.classify_kernels = classify_kernels
 
 
 class _ProfilerTorch(_ProfilerConcreteBase):
@@ -309,6 +374,8 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             self.torch_profiler.export_chrome_trace(
                 os.path.join(self.output_dir, filename)
             )
+            if self.classify_kernels:
+                classify_trace_file(os.path.join(self.output_dir, filename))
         torch.distributed.barrier(self.cpu_group)
 
         # TODO: migrate `_merge_profile_traces`

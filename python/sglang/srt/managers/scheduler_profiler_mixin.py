@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
@@ -13,8 +14,11 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_merger import ProfileMerger, classify_trace_file
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    get_iteration_profile_context,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -64,6 +68,9 @@ class SchedulerProfilerMixin:
         # For ROCM
         self.rpd_profiler = None
 
+        self.profile_annotate_iterations = False
+        self.profile_classify_kernels = False
+
     def init_profile(
         self: Scheduler,
         output_dir: Optional[str],
@@ -91,6 +98,9 @@ class SchedulerProfilerMixin:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                classify_kernels=getattr(
+                    self.server_args, "profile_classify_kernels", False
+                ),
             )
 
         if self.profile_in_progress:
@@ -101,6 +111,12 @@ class SchedulerProfilerMixin:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
+        self.profile_annotate_iterations = getattr(
+            self.server_args, "profile_annotate_iterations", False
+        )
+        self.profile_classify_kernels = getattr(
+            self.server_args, "profile_classify_kernels", False
+        )
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -229,7 +245,13 @@ class SchedulerProfilerMixin:
 
         try:
             logger.info("Starting profile merge...")
-            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
+            merger = ProfileMerger(
+                self.torch_profiler_output_dir,
+                self.profile_id,
+                classify_kernels=getattr(
+                    self.server_args, "profile_classify_kernels", False
+                ),
+            )
             merged_path = merger.merge_chrome_traces()
 
             summary = merger.get_merge_summary()
@@ -291,6 +313,10 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
+                if self.profile_classify_kernels:
+                    classify_trace_file(
+                        os.path.join(self.torch_profiler_output_dir, filename)
+                    )
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -373,6 +399,23 @@ class SchedulerProfilerMixin:
                 and self.profiler_start_forward_ct == self.forward_ct
             ):
                 self.start_profile()
+
+    def get_profile_iteration_context(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> AbstractContextManager:
+        if not getattr(self.server_args, "profile_annotate_iterations", False):
+            return nullcontext()
+
+        if envs.SGLANG_PROFILE_V2.get():
+            profiler_active = (
+                hasattr(self, "_profile_manager")
+                and self._profile_manager is not None
+                and self._profile_manager.profiler is not None
+            )
+        else:
+            profiler_active = self.profile_in_progress
+
+        return get_iteration_profile_context(batch, profiler_active)
 
     def profile(self: Scheduler, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
