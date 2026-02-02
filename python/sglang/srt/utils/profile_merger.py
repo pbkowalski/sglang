@@ -197,7 +197,7 @@ class ProfileMerger:
             ("gemm", r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)"),
             ("moe", r"(moe|expert|mixtral|fused_moe|router|topk)"),
             ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
-            ("comm", r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv)"),
+            ("comm", r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)"),
             ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|norm)"),
             ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
             ("embedding", r"(embedding|rope|pos_enc|posenc)"),

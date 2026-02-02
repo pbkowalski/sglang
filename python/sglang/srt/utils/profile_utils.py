@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -175,13 +176,31 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
     )
 
 
+def build_iteration_profile_args(batch: "ScheduleBatch") -> dict:
+    args: dict[str, object] = {
+        "batch_size": len(batch.reqs or []),
+        "is_prefill_only": bool(batch.is_prefill_only),
+    }
+    if batch.global_num_tokens is not None:
+        args["global_num_tokens"] = batch.global_num_tokens
+    return args
+
+
+def _record_function_with_args(name: str, args: dict) -> AbstractContextManager:
+    try:
+        return record_function(name, args=json.dumps(args))
+    except TypeError:
+        return record_function(name)
+
+
 def get_iteration_profile_context(
     batch: "ScheduleBatch", enabled: bool
 ) -> AbstractContextManager:
     if not enabled:
         return nullcontext()
     name = build_iteration_profile_annotation(batch)
-    return record_function(name)
+    args = build_iteration_profile_args(batch)
+    return _record_function_with_args(name, args)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
