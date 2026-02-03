@@ -169,10 +169,25 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
         else:
             num_ctx_tokens = sum(req.extend_input_len for req in reqs)
         num_gen_tokens = num_gen_requests
-
+    if batch.batch_size is not None:
+        batch_size = batch.batch_size()
+    else:
+        batch_size = len(batch.reqs)
+    if batch.prefix_lens is not None:
+        prefix_lens = batch.prefix_lens
+    else:   
+        prefix_lens = 0
+    if batch.extend_lens is not None:
+        extend_lens = batch.extend_lens
+    else:
+        extend_lens = 0
+    if batch.seq_lens is not None:
+        seq_lens = batch.seq_lens
+    else:
+        seq_lens = 0
     return (
         f"{stage}_context_{num_ctx_requests}({num_ctx_tokens})_generation_"
-        f"{num_gen_requests}({num_gen_tokens})"
+        f"{num_gen_requests}({num_gen_tokens})_prefix_numtokens_{sum(prefix_lens)}_extend_numtokens_{sum(extend_lens)}_seq_lens_sum_{sum(seq_lens)}"
     )
 
 
