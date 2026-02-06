@@ -1,23 +1,23 @@
 # Build context must include ./sglang from ~/sglang.
-FROM lmsysorg/sglang:v0.5.8-rocm700-mi35x
+FROM lmsysorg/sglang:v0.5.7-rocm700-mi35x
 
 USER root
 
 RUN bash -c 'set -euo pipefail; \
     pip uninstall -y sgl_kernel sglang; \
-    rm -rf /sgl-workspace/sglang /workspace/sglang'
+    rm -rf /sgl-workspace/sglang'
 
-COPY sglang /workspace/sglang
+COPY sglang /sgl-workspace/sglang
 
 ENV AMDGPU_TARGET=gfx950
 
 RUN bash -c 'set -euo pipefail; \
-    pushd /workspace/sglang/sgl-kernel; \
+    pushd /sgl-workspace/sglang/sgl-kernel; \
     rm -f pyproject.toml; \
     cp pyproject_rocm.toml pyproject.toml; \
     python3 setup_rocm.py install; \
     popd; \
-    pushd /workspace/sglang; \
+    pushd /sgl-workspace/sglang; \
     rm -rf python/pyproject.toml; \
     cp python/pyproject_other.toml python/pyproject.toml; \
     pip install -e "python[all_hip]"; \

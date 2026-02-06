@@ -164,14 +164,6 @@ class ProfileMerger:
                 if kernel_type is not None:
                     args = event.setdefault("args", {})
                     args.setdefault("kernel_type", kernel_type)
-                    if isinstance(event.get("cat"), str):
-                        cat = event["cat"]
-                        kernel_cat = f"sg_kernel_{kernel_type}"
-                        if kernel_cat not in cat:
-                            event["cat"] = f"{cat},{kernel_cat}" if cat else kernel_cat
-                    else:
-                        event["cat"] = f"sg_kernel_{kernel_type}"
-
         return events
 
     def _classify_kernel_event(self, event: Dict) -> Optional[str]:
@@ -244,14 +236,14 @@ def classify_trace_file(trace_path: str) -> bool:
             args["kernel_type"] = kernel_type
             updated = True
         cat = event.get("cat")
-        kernel_cat = f"sg_kernel_{kernel_type}"
-        if isinstance(cat, str):
-            if kernel_cat not in cat:
-                event["cat"] = f"{cat},{kernel_cat}" if cat else kernel_cat
-                updated = True
-        elif cat is None:
-            event["cat"] = kernel_cat
-            updated = True
+        # kernel_cat = f"sg_kernel_{kernel_type}"
+        # if isinstance(cat, str):
+        #     if kernel_cat not in cat:
+        #         event["cat"] = f"{cat},{kernel_cat}" if cat else kernel_cat
+        #         updated = True
+        # elif cat is None:
+        #     event["cat"] = kernel_cat
+        #     updated = True
 
     if not updated:
         return False

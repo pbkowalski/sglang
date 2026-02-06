@@ -1,0 +1,14 @@
+FROM lmsysorg/sglang:v0.5.7
+
+USER root
+
+RUN bash -c 'set -euo pipefail; \
+    pip uninstall -y sgl_kernel sglang; \
+    rm -rf /sgl-workspace/sglang'
+
+COPY sglang /sgl-workspace/sglang
+
+#ENV AMDGPU_TARGET=gfx950
+
+RUN pip install --upgrade pip
+RUN pip install -e "python"
