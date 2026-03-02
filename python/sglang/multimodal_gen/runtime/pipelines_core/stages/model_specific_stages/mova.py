@@ -17,6 +17,7 @@ import os
 from collections.abc import Iterable
 
 import torch
+import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
@@ -200,11 +201,13 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def compile_module_with_torch_compile(self, module, server_args: ServerArgs):
-        if not server_args.enable_torch_compile or module is None:
-            return module
-        if not hasattr(module, "forward"):
-            return module
+    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
+        """
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
+        """
+        if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
         try:
             import torch._inductor.config as _inductor_cfg
 
@@ -213,15 +216,14 @@ class MOVADenoisingStage(PipelineStage):
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
-        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
-        setattr(module, "forward", compiled_forward)
-        return module
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(mode=mode, fullgraph=False, dynamic=None)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
         for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            self.compile_module_with_torch_compile(module, server_args)
+            self._maybe_enable_torch_compile(module, server_args)
         self._torch_compiled = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -310,8 +312,8 @@ class MOVADenoisingStage(PipelineStage):
 
     def _manage_device_placement(
         self,
-        model_to_use: torch.nn.Module | None,
-        model_to_offload: torch.nn.Module | None,
+        model_to_use: nn.Module | None,
+        model_to_offload: nn.Module | None,
         server_args: ServerArgs,
     ):
         if not server_args.dit_cpu_offload:
@@ -347,6 +349,11 @@ class MOVADenoisingStage(PipelineStage):
         self._manage_device_placement(current_model, model_to_offload, server_args)
         return current_model
 
+    def _ensure_shared_models_on_device(self, server_args: ServerArgs):
+        """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
+        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
+
     def _apply_guidance_rescale(
         self,
         noise_pred,
@@ -376,7 +383,7 @@ class MOVADenoisingStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         self._maybe_compile_dits(server_args)
-        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._ensure_shared_models_on_device(server_args)
 
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
@@ -397,7 +404,7 @@ class MOVADenoisingStage(PipelineStage):
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
-        timings = getattr(batch, "timings", None)
+        metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
         with self.progress_bar(total=total_steps) as progress_bar:
@@ -405,7 +412,7 @@ class MOVADenoisingStage(PipelineStage):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
                     logger=logger,
-                    timings=timings,
+                    metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
                 ):
                     pair_t = paired_timesteps[idx_step]
@@ -701,7 +708,7 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_visual_seq_len, -1)
+            .reshape(full_visual_seq_len, 1, -1)
             .to(visual_x.device)
         )
 
@@ -720,7 +727,7 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_audio_seq_len, -1)
+            .reshape(full_audio_seq_len, 1, -1)
             .to(audio_x.device)
         )
 
@@ -731,15 +738,6 @@ class MOVADenoisingStage(PipelineStage):
         # Shard freqs to match local sequence length
         visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
         audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
-
-        visual_freqs = (
-            visual_freqs.real.contiguous().float(),
-            visual_freqs.imag.contiguous().float(),
-        )
-        audio_freqs = (
-            audio_freqs.real.contiguous().float(),
-            audio_freqs.imag.contiguous().float(),
-        )
 
         # Forward through dual-tower DiT
         visual_x, audio_x = self.forward_dual_tower_dit(
@@ -779,8 +777,8 @@ class MOVADenoisingStage(PipelineStage):
         audio_context: torch.Tensor,
         visual_t_mod: torch.Tensor,
         audio_t_mod: torch.Tensor,
-        visual_freqs: tuple[torch.Tensor, torch.Tensor],
-        audio_freqs: tuple[torch.Tensor, torch.Tensor],
+        visual_freqs: torch.Tensor,
+        audio_freqs: torch.Tensor,
         grid_size: tuple[int, int, int],
         video_fps: float,
         full_visual_seq_len: int,
@@ -915,6 +913,6 @@ class MOVADecodingStage(PipelineStage):
             output=video,
             audio=audio,
             audio_sample_rate=getattr(self.audio_vae, "sample_rate", None),
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
         return output_batch

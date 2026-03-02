@@ -17,15 +17,25 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb_qk
+from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -308,6 +318,7 @@ class GlmImageAttention(torch.nn.Module):
         eps,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -322,13 +333,23 @@ class GlmImageAttention(torch.nn.Module):
 
         self.num_kv_heads = self.dim_head // self.inner_kv_dim
 
-        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
-        self.to_v = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
+        self.to_q = ReplicatedLinear(
+            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_k = ReplicatedLinear(
+            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_v = ReplicatedLinear(
+            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        )
 
         # (dropout omitted)
         self.to_out = nn.ModuleList(
-            [ReplicatedLinear(self.inner_dim, self.out_dim, bias=True)]
+            [
+                ReplicatedLinear(
+                    self.inner_dim, self.out_dim, bias=True, quant_config=quant_config
+                )
+            ]
         )
 
         if qk_norm is None:
@@ -387,15 +408,28 @@ class GlmImageAttention(torch.nn.Module):
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
-            query[:, text_seq_length:, :, :], key[:, text_seq_length:, :, :] = (
-                _apply_rotary_emb_qk(
-                    query[:, text_seq_length:, :, :],
-                    key[:, text_seq_length:, :, :],
-                    cos,
-                    sin,
-                    is_neox_style=True,
+
+            if _is_cuda and cos.dim() == 2:
+                q_img = query[:, text_seq_length:, :, :]
+                k_img = key[:, text_seq_length:, :, :]
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
                 )
-            )
+                # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
+                q_out, k_out = apply_flashinfer_rope_qk_inplace(
+                    q_img, k_img, cos_sin_cache, is_neox=True
+                )
+            else:
+                query[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    query[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
+                key[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    key[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
@@ -446,6 +480,7 @@ class GlmImageTransformerBlock(nn.Module):
         time_embed_dim: int = 512,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -463,6 +498,7 @@ class GlmImageTransformerBlock(nn.Module):
             eps=1e-5,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn1",
+            quant_config=quant_config,
         )
 
         # 2. Feedforward
@@ -667,6 +703,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self,
         config: GlmImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
 
@@ -727,6 +764,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.time_embed_dim,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"transformer_blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(arch_config.num_layers)
             ]
@@ -790,6 +828,18 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         prior_embedding = self.prior_token_embedding(prior_token_id)
         prior_embedding[prior_token_drop] *= 0.0
         prior_hidden_states = self.prior_projector(prior_embedding)
+        # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
+        # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).
+        if (
+            get_sp_world_size() > 1
+            and prior_hidden_states.shape[1] != hidden_states.shape[1]
+        ):
+            rank = get_sp_parallel_rank()
+            sp_world_size = get_sp_world_size()
+            chunk = prior_hidden_states.shape[1] // sp_world_size
+            prior_hidden_states = prior_hidden_states[
+                :, rank * chunk : (rank + 1) * chunk, :
+            ]
         hidden_states = hidden_states + prior_hidden_states
 
         temb = self.time_condition_embed(
