@@ -591,8 +591,7 @@ class ServerArgs:
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
-    profile_annotate_iterations: bool = False
-    profile_classify_kernels: bool = False
+    profile_annotate: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -4720,14 +4719,12 @@ class ServerArgs:
             help="Enable layerwise NVTX profiling annotations for the model.",
         )
         parser.add_argument(
-            "--profile-annotate-iterations",
+            "--profile-annotate",
             action="store_true",
-            help="Annotate each forward iteration in profiler traces with prefill/decode request and token counts.",
-        )
-        parser.add_argument(
-            "--profile-classify-kernels",
-            action="store_true",
-            help="Classify CUDA kernel events by type (e.g., gemm, moe, attention) when merging traces.",
+            help=(
+                "Enable extended profiling annotations (per-iteration labels) "
+                "and kernel classification in merged traces."
+            ),
         )
         parser.add_argument(
             "--enable-nccl-nvls",

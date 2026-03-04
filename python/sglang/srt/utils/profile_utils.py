@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import re
 import time
+import gzip
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -15,7 +17,6 @@ from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.profile_merger import classify_trace_file
 
 _is_npu = is_npu()
 if _is_npu:
@@ -67,7 +68,7 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
-        classify_kernels: bool = False,
+        profile_annotate: bool = False,
     ):
         # not supported yet
         assert start_step is None
@@ -88,7 +89,7 @@ class ProfileManager:
             output_dir=output_dir,
             output_prefix=profile_prefix,
             profile_id=profile_id,
-            classify_kernels=classify_kernels,
+            profile_annotate=profile_annotate,
         )
 
         self.stage_based_trigger.configure(
@@ -169,25 +170,20 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
         else:
             num_ctx_tokens = sum(req.extend_input_len for req in reqs)
         num_gen_tokens = num_gen_requests
-    if batch.batch_size is not None:
-        batch_size = batch.batch_size()
-    else:
-        batch_size = len(batch.reqs)
-    if batch.prefix_lens is not None:
-        prefix_lens = batch.prefix_lens
-    else:   
-        prefix_lens = 0
-    if batch.extend_lens is not None:
-        extend_lens = batch.extend_lens
-    else:
-        extend_lens = 0
-    if batch.seq_lens is not None:
-        seq_lens = batch.seq_lens
-    else:
-        seq_lens = 0
+    def _sum_lens(value) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, torch.Tensor):
+            return int(value.sum().item())
+        return sum(value)
+
+    prefix_sum = _sum_lens(batch.prefix_lens)
+    extend_sum = _sum_lens(batch.extend_lens)
+    seq_sum = _sum_lens(batch.seq_lens)
     return (
         f"{stage}_context_{num_ctx_requests}({num_ctx_tokens})_generation_"
-        f"{num_gen_requests}({num_gen_tokens})_prefix_numtokens_{sum(prefix_lens)}_extend_numtokens_{sum(extend_lens)}_seq_lens_sum_{sum(seq_lens)}"
+        f"{num_gen_requests}({num_gen_tokens})_prefix_numtokens_{prefix_sum}"
+        f"_extend_numtokens_{extend_sum}_seq_lens_sum_{seq_sum}"
     )
 
 
@@ -216,6 +212,76 @@ def get_iteration_profile_context(
     name = build_iteration_profile_annotation(batch)
     args = build_iteration_profile_args(batch)
     return _record_function_with_args(name, args)
+
+
+def _classify_kernel_name(name: str) -> Optional[str]:
+    patterns = [
+        (
+            "gemm",
+            r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)",
+        ),
+        ("moe", r"(moe|expert|mixtral|fused_moe|router|topk)"),
+        ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
+        (
+            "comm",
+            r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)",
+        ),
+        ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|norm)"),
+        ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
+        ("embedding", r"(embedding|rope|pos_enc|posenc)"),
+    ]
+    for label, pattern in patterns:
+        if re.search(pattern, name):
+            return label
+    return None
+
+
+def _classify_kernel_event_for_trace(event: Dict) -> Optional[str]:
+    cat = event.get("cat", "")
+    if isinstance(cat, str):
+        cat_lower = cat.lower()
+        if "cuda" not in cat_lower and "kernel" not in cat_lower and "gpu" not in cat_lower:
+            return None
+    name = str(event.get("name") or "").lower()
+    if not name:
+        return None
+    return _classify_kernel_name(name)
+
+
+def classify_trace_file(trace_path: str) -> bool:
+    try:
+        with gzip.open(trace_path, "rt", encoding="utf-8") as f:
+            trace = json.load(f)
+    except Exception as exc:
+        logger.error("Failed to read trace file %s: %s", trace_path, exc)
+        return False
+
+    events = trace.get("traceEvents", [])
+    if not isinstance(events, list):
+        return False
+
+    updated = False
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kernel_type = _classify_kernel_event_for_trace(event)
+        if kernel_type is None:
+            continue
+        args = event.setdefault("args", {})
+        if "kernel_type" not in args:
+            args["kernel_type"] = kernel_type
+            updated = True
+
+    if not updated:
+        return False
+
+    try:
+        with gzip.open(trace_path, "wb") as f:
+            f.write(json.dumps(trace).encode("utf-8"))
+        return True
+    except Exception as exc:
+        logger.error("Failed to write trace file %s: %s", trace_path, exc)
+        return False
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -340,7 +406,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         tp_rank: int,
         cpu_group,
         first_rank_in_node: bool,
-        classify_kernels: bool = False,
+        profile_annotate: bool = False,
     ):
         self.output_dir = output_dir
         self.output_prefix = output_prefix
@@ -349,7 +415,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.tp_rank = tp_rank
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
-        self.classify_kernels = classify_kernels
+        self.profile_annotate = profile_annotate
 
 
 class _ProfilerTorch(_ProfilerConcreteBase):
@@ -408,8 +474,6 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             self.torch_profiler.export_chrome_trace(
                 os.path.join(self.output_dir, filename)
             )
-            if self.classify_kernels:
-                classify_trace_file(os.path.join(self.output_dir, filename))
         torch.distributed.barrier(self.cpu_group)
 
         # TODO: migrate `_merge_profile_traces`

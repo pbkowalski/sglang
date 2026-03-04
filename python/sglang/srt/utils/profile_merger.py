@@ -1,8 +1,6 @@
 """Merge Chrome trace files from multiple ranks (TP, DP, PP, EP) into a single trace."""
 
 import glob
-import gzip
-import json
 import logging
 import os
 import re
@@ -14,12 +12,10 @@ logger = logging.getLogger(__name__)
 class ProfileMerger:
     """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
 
-    def __init__(
-        self, output_dir: str, profile_id: str, classify_kernels: bool = False
-    ):
+    def __init__(self, output_dir: str, profile_id: str, profile_annotate: bool = False):
         self.output_dir = output_dir
         self.profile_id = profile_id
-        self.classify_kernels = classify_kernels
+        self.profile_annotate = profile_annotate
         self.merged_trace_path = os.path.join(
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
@@ -159,7 +155,7 @@ class ProfileMerger:
 
             event["pid"] = f"{rank_label} {event['pid']}"
 
-            if self.classify_kernels:
+            if self.profile_annotate:
                 kernel_type = self._classify_kernel_event(event)
                 if kernel_type is not None:
                     args = event.setdefault("args", {})
@@ -186,10 +182,16 @@ class ProfileMerger:
     @staticmethod
     def _classify_kernel_name(name: str) -> Optional[str]:
         patterns = [
-            ("gemm", r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)"),
+            (
+                "gemm",
+                r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)",
+            ),
             ("moe", r"(moe|expert|mixtral|fused_moe|router|topk)"),
             ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
-            ("comm", r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)"),
+            (
+                "comm",
+                r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)",
+            ),
             ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|norm)"),
             ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
             ("embedding", r"(embedding|rope|pos_enc|posenc)"),
@@ -198,63 +200,6 @@ class ProfileMerger:
             if re.search(pattern, name):
                 return label
         return None
-
-
-def _classify_kernel_event_for_trace(event: Dict) -> Optional[str]:
-    cat = event.get("cat", "")
-    if isinstance(cat, str):
-        cat_lower = cat.lower()
-        if "cuda" not in cat_lower and "kernel" not in cat_lower and "gpu" not in cat_lower:
-            return None
-    name = str(event.get("name") or "").lower()
-    if not name:
-        return None
-    return ProfileMerger._classify_kernel_name(name)
-
-
-def classify_trace_file(trace_path: str) -> bool:
-    try:
-        with gzip.open(trace_path, "rt", encoding="utf-8") as f:
-            trace = json.load(f)
-    except Exception as exc:
-        logger.error("Failed to read trace file %s: %s", trace_path, exc)
-        return False
-
-    events = trace.get("traceEvents", [])
-    if not isinstance(events, list):
-        return False
-
-    updated = False
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        kernel_type = _classify_kernel_event_for_trace(event)
-        if kernel_type is None:
-            continue
-        args = event.setdefault("args", {})
-        if "kernel_type" not in args:
-            args["kernel_type"] = kernel_type
-            updated = True
-        cat = event.get("cat")
-        # kernel_cat = f"sg_kernel_{kernel_type}"
-        # if isinstance(cat, str):
-        #     if kernel_cat not in cat:
-        #         event["cat"] = f"{cat},{kernel_cat}" if cat else kernel_cat
-        #         updated = True
-        # elif cat is None:
-        #     event["cat"] = kernel_cat
-        #     updated = True
-
-    if not updated:
-        return False
-
-    try:
-        with gzip.open(trace_path, "wb") as f:
-            f.write(json.dumps(trace).encode("utf-8"))
-        return True
-    except Exception as exc:
-        logger.error("Failed to write trace file %s: %s", trace_path, exc)
-        return False
 
     def _calculate_sort_index(self, rank_info: Dict[str, int], pid: int) -> int:
         sort_index = pid
