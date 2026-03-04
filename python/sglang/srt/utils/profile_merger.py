@@ -1,6 +1,8 @@
 """Merge Chrome trace files from multiple ranks (TP, DP, PP, EP) into a single trace."""
 
 import glob
+import gzip
+import json
 import logging
 import os
 import re
@@ -12,7 +14,9 @@ logger = logging.getLogger(__name__)
 class ProfileMerger:
     """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
 
-    def __init__(self, output_dir: str, profile_id: str, profile_annotate: bool = False):
+    def __init__(
+        self, output_dir: str, profile_id: str, profile_annotate: bool = False
+    ):
         self.output_dir = output_dir
         self.profile_id = profile_id
         self.profile_annotate = profile_annotate

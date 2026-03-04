@@ -1,14 +1,14 @@
+import gzip
 import json
 import logging
 import os
 import re
 import time
-import gzip
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import torch
 from torch.profiler import record_function
@@ -170,6 +170,7 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
         else:
             num_ctx_tokens = sum(req.extend_input_len for req in reqs)
         num_gen_tokens = num_gen_requests
+
     def _sum_lens(value) -> int:
         if value is None:
             return 0
@@ -240,7 +241,11 @@ def _classify_kernel_event_for_trace(event: Dict) -> Optional[str]:
     cat = event.get("cat", "")
     if isinstance(cat, str):
         cat_lower = cat.lower()
-        if "cuda" not in cat_lower and "kernel" not in cat_lower and "gpu" not in cat_lower:
+        if (
+            "cuda" not in cat_lower
+            and "kernel" not in cat_lower
+            and "gpu" not in cat_lower
+        ):
             return None
     name = str(event.get("name") or "").lower()
     if not name:
