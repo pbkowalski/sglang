@@ -95,7 +95,7 @@ class SchedulerProfilerMixin:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
-                profile_annotate=getattr(self.server_args, "profile_annotate", False),
+                profile_annotate=self.server_args.profile_annotate,
             )
 
         if self.profile_in_progress:
@@ -236,7 +236,7 @@ class SchedulerProfilerMixin:
             merger = ProfileMerger(
                 self.torch_profiler_output_dir,
                 self.profile_id,
-                profile_annotate=getattr(self.server_args, "profile_annotate", False),
+                profile_annotate=self.server_args.profile_annotate,
             )
             merged_path = merger.merge_chrome_traces()
 
@@ -385,7 +385,7 @@ class SchedulerProfilerMixin:
     def get_profile_iteration_context(
         self: Scheduler, batch: ScheduleBatch
     ) -> AbstractContextManager:
-        if not getattr(self.server_args, "profile_annotate", False):
+        if not self.server_args.profile_annotate:
             return nullcontext()
 
         if envs.SGLANG_PROFILE_V2.get():

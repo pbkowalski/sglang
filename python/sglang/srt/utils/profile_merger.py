@@ -8,6 +8,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from sglang.srt.utils.profile_utils import _classify_kernel_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,7 +174,7 @@ class ProfileMerger:
         name = str(event.get("name") or "").lower()
         if not name:
             return None
-        return self._classify_kernel_name(name)
+        return _classify_kernel_name(name)
 
     @staticmethod
     def _is_kernel_event(event: Dict) -> bool:
@@ -182,28 +184,6 @@ class ProfileMerger:
             if "cuda" in cat_lower or "kernel" in cat_lower or "gpu" in cat_lower:
                 return True
         return False
-
-    @staticmethod
-    def _classify_kernel_name(name: str) -> Optional[str]:
-        patterns = [
-            (
-                "gemm",
-                r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)",
-            ),
-            ("moe", r"(moe|expert|mixtral|fused_moe|router|topk)"),
-            ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
-            (
-                "comm",
-                r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)",
-            ),
-            ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|norm)"),
-            ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
-            ("embedding", r"(embedding|rope|pos_enc|posenc)"),
-        ]
-        for label, pattern in patterns:
-            if re.search(pattern, name):
-                return label
-        return None
 
     def _calculate_sort_index(self, rank_info: Dict[str, int], pid: int) -> int:
         sort_index = pid

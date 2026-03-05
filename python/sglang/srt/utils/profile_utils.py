@@ -1,5 +1,3 @@
-import gzip
-import json
 import logging
 import os
 import re
@@ -188,31 +186,13 @@ def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
     )
 
 
-def build_iteration_profile_args(batch: "ScheduleBatch") -> dict:
-    args: dict[str, object] = {
-        "batch_size": len(batch.reqs or []),
-        "is_prefill_only": bool(batch.is_prefill_only),
-    }
-    if batch.global_num_tokens is not None:
-        args["global_num_tokens"] = batch.global_num_tokens
-    return args
-
-
-def _record_function_with_args(name: str, args: dict) -> AbstractContextManager:
-    try:
-        return record_function(name, args=json.dumps(args))
-    except TypeError:
-        return record_function(name)
-
-
 def get_iteration_profile_context(
     batch: "ScheduleBatch", enabled: bool
 ) -> AbstractContextManager:
     if not enabled:
         return nullcontext()
     name = build_iteration_profile_annotation(batch)
-    args = build_iteration_profile_args(batch)
-    return _record_function_with_args(name, args)
+    return record_function(name)
 
 
 def _classify_kernel_name(name: str) -> Optional[str]:
@@ -221,13 +201,13 @@ def _classify_kernel_name(name: str) -> Optional[str]:
             "gemm",
             r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)",
         ),
-        ("moe", r"(moe|expert|mixtral|fused_moe|router|topk)"),
+        ("moe", r"(moe|expert|mixtral|fused_moe|router|\btopk\b)"),
         ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
         (
             "comm",
             r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)",
         ),
-        ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|norm)"),
+        ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|\bnorm\b)"),
         ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
         ("embedding", r"(embedding|rope|pos_enc|posenc)"),
     ]
@@ -235,58 +215,6 @@ def _classify_kernel_name(name: str) -> Optional[str]:
         if re.search(pattern, name):
             return label
     return None
-
-
-def _classify_kernel_event_for_trace(event: Dict) -> Optional[str]:
-    cat = event.get("cat", "")
-    if isinstance(cat, str):
-        cat_lower = cat.lower()
-        if (
-            "cuda" not in cat_lower
-            and "kernel" not in cat_lower
-            and "gpu" not in cat_lower
-        ):
-            return None
-    name = str(event.get("name") or "").lower()
-    if not name:
-        return None
-    return _classify_kernel_name(name)
-
-
-def classify_trace_file(trace_path: str) -> bool:
-    try:
-        with gzip.open(trace_path, "rt", encoding="utf-8") as f:
-            trace = json.load(f)
-    except Exception as exc:
-        logger.error("Failed to read trace file %s: %s", trace_path, exc)
-        return False
-
-    events = trace.get("traceEvents", [])
-    if not isinstance(events, list):
-        return False
-
-    updated = False
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        kernel_type = _classify_kernel_event_for_trace(event)
-        if kernel_type is None:
-            continue
-        args = event.setdefault("args", {})
-        if "kernel_type" not in args:
-            args["kernel_type"] = kernel_type
-            updated = True
-
-    if not updated:
-        return False
-
-    try:
-        with gzip.open(trace_path, "wb") as f:
-            f.write(json.dumps(trace).encode("utf-8"))
-        return True
-    except Exception as exc:
-        logger.error("Failed to write trace file %s: %s", trace_path, exc)
-        return False
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
