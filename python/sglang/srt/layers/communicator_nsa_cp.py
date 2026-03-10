@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -138,6 +139,19 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         )
 
     @staticmethod
+    def _simple(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        if hidden_states.shape[0] != 0:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
     def _gather_hidden_states_and_residual(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -148,6 +162,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         residual_input_mode,
     ):
         if hidden_states.shape[0] != 0:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
