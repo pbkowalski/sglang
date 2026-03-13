@@ -32,6 +32,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
@@ -153,7 +154,10 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         context: CommunicateContext,
     ):
         if hidden_states.shape[0] != 0:
-            hidden_states = attn_tp_all_reduce(hidden_states)
+            if nsa_use_prefill_cp(forward_batch):
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
@@ -168,7 +172,10 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         residual_input_mode,
     ):
         if hidden_states.shape[0] != 0:
-            hidden_states = attn_tp_all_reduce(hidden_states)
+            if nsa_use_prefill_cp(forward_batch):
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
