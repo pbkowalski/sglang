@@ -13,7 +13,6 @@
 # ==============================================================================
 
 
-import os
 from functools import partial
 from typing import Callable, Optional
 
@@ -24,8 +23,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
-
-_CP_COMM_DEBUG = os.environ.get("SGLANG_CP_COMM_DEBUG", "0") == "1"
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -175,18 +172,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        cp_active = nsa_use_prefill_cp(forward_batch)
-        if _CP_COMM_DEBUG:
-            import torch.distributed as dist
-
-            _r = dist.get_rank()
-            print(
-                f"[CP_COMM][r{_r}] _gather: cp_active={cp_active} "
-                f"h_shape={hidden_states.shape} "
-                f"h_mean={hidden_states.float().mean().item():.6f}",
-                flush=True,
-            )
-        if cp_active:
+        if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -196,13 +182,6 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 hidden_states,
                 local_hidden_states,
             )
-            if _CP_COMM_DEBUG:
-                print(
-                    f"[CP_COMM][r{_r}] _gather after allgather: "
-                    f"h_shape={hidden_states.shape} "
-                    f"h_mean={hidden_states.float().mean().item():.6f}",
-                    flush=True,
-                )
         return hidden_states, residual
 
 
@@ -242,19 +221,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        cp_active = nsa_use_prefill_cp(forward_batch)
-        if _CP_COMM_DEBUG:
-            import torch.distributed as dist
-
-            _r = dist.get_rank()
-            print(
-                f"[CP_COMM][r{_r}] _scatter: cp_active={cp_active} "
-                f"rr={is_nsa_prefill_cp_round_robin_split()} "
-                f"h_shape={hidden_states.shape} "
-                f"h_mean={hidden_states.float().mean().item():.6f}",
-                flush=True,
-            )
-        if cp_active:
+        if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             if is_nsa_prefill_cp_round_robin_split():
                 hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
@@ -266,11 +233,4 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
                     context.attn_cp_rank
                 ]
                 attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-            if _CP_COMM_DEBUG:
-                print(
-                    f"[CP_COMM][r{_r}] _scatter after: "
-                    f"h_shape={hidden_states.shape} "
-                    f"h_mean={hidden_states.float().mean().item():.6f}",
-                    flush=True,
-                )
         return hidden_states, residual
