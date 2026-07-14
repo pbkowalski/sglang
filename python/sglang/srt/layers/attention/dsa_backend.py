@@ -406,7 +406,10 @@ class DeepseekSparseAttnBackend(
             )
             # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
             # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
-            self.need_pad_heads = self.num_q_heads < 16
+            # Exception: num_q_heads == 8 with fp8 kv cache is natively supported and does not need padding.
+            self.need_pad_heads = self.num_q_heads < 16 and not (
+                self.num_q_heads == 8 and model_runner.kv_cache_dtype == fp8_dtype
+            )
             self.head_repeat_factor = (
                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
@@ -2446,32 +2449,45 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        # Attention output is always bf16 even when q/kv are fp8 (the fused rope
+        # path can hand us an fp8 q), so allocate explicitly rather than
+        # inheriting q's (possibly fp8) dtype.
+        out_dtype = torch.bfloat16
 
-        if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = torch.empty(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
+                device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        # Use the layer's fp8 KV scale for both q and kv when the cache is fp8.
+        # (Passing kv_scale=1.0 / q_scale=None makes the FP8 ASM MLA kernel abort
+        # with "fp8 Q requires q_scale and kv_scale"; the validated DSA+Aiter fp8
+        # path uses the real k_scale for both.)
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            fp8_scale = layer.k_scale
+            q_scale = fp8_scale
+            kv_scale = fp8_scale
 
         kv_indptr = self.kv_indptr
 
@@ -2524,32 +2540,40 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        # Attention output is always bf16 even when q/kv are fp8.
+        out_dtype = torch.bfloat16
 
-        if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = torch.empty(
+            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
+                device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        # Use the layer's fp8 KV scale for both q and kv when the cache is fp8.
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            fp8_scale = layer.k_scale
+            q_scale = fp8_scale
+            kv_scale = fp8_scale
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)

@@ -544,11 +544,13 @@ class DeepseekMLAForwardMixin:
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
+        skip_rope_for_dsa_aiter_fused = self._skip_rope_for_dsa_aiter_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
+            and (not skip_rope_for_dsa_aiter_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (
                 not _use_aiter
@@ -626,7 +628,10 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused()
+                or self._skip_rope_for_dsa_aiter_fused()
+            ) and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -1033,6 +1038,19 @@ class DeepseekMLAForwardMixin:
                 server_args.dsa_decode_backend == "tilelang"
                 or server_args.dsa_prefill_backend == "tilelang"
             )
+        )
+
+    def _skip_rope_for_dsa_aiter_fused(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Check if we should skip rope and use fused rope+cache path for aiter DSA on gfx95.
+        When true, fused_qk_rope_cat_and_cache_mla outputs q in fp8 directly (when
+        kv_cache_dtype is fp8), avoiding a separate scaled_fp8_quant in _forward_aiter.
+        """
+        server_args = get_server_args()
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend in ("dsa", "nsa")
+            and server_args.dsa_decode_backend == "aiter"
         )
 
     def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
