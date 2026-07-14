@@ -2198,7 +2198,6 @@ class DeepseekSparseAttnBackend(
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
         )
 
         if self.need_pad_heads:
@@ -2295,7 +2294,6 @@ class DeepseekSparseAttnBackend(
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
         )
 
         if self.need_pad_heads:
