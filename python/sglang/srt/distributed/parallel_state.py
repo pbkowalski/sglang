@@ -1802,7 +1802,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_CP, _ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2201,7 +2201,14 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            # attention_tp is a real TP subgroup here (attn_tp_size < tp_size, e.g.
+            # under attn-CP/attn-DP) and performs attention-output all-reduces in the
+            # model forward. It needs a CUDA-graph-capturable collective: without
+            # pynccl (or custom AR) it falls back to torch.distributed.all_reduce,
+            # whose c10d NCCL Work event is polled by the watchdog during graph
+            # capture -> hipErrorCapturedEvent. Enable pynccl so graph_capture() can
+            # route these all-reduces through the capturable path.
+            use_pynccl=True,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
