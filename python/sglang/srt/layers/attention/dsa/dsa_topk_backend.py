@@ -7,12 +7,14 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_hip = is_hip()
+_is_gfx95 = _is_hip and is_gfx95_supported()
+_AITER_DECODE_TOPK_MAX_ROWS = 4
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -29,6 +31,7 @@ class TopkTransformMethod(IntEnum):
 
 class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
+    AITER = "aiter"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
 
@@ -44,7 +47,12 @@ class DSATopKBackend(Enum):
         return cls(get_exec().kernel.dsa_topk_backend)
 
     def is_sgl_kernel(self) -> bool:
-        return self == DSATopKBackend.SGL_KERNEL
+        # AITER replaces only the supported decode selection step. All other
+        # shapes and transforms deliberately retain the SGL kernel contract.
+        return self in (DSATopKBackend.SGL_KERNEL, DSATopKBackend.AITER)
+
+    def is_aiter(self) -> bool:
+        return self == DSATopKBackend.AITER
 
     def is_torch(self) -> bool:
         return self == DSATopKBackend.TORCH
@@ -53,7 +61,7 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        return self == DSATopKBackend.SGL_KERNEL and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
     def topk_func(
         self,
@@ -108,6 +116,43 @@ class DSATopKBackend(Enum):
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+
+        if self.is_aiter() and _can_use_aiter_decode_topk(
+            logits=logits,
+            lengths=lengths,
+            topk=topk,
+            topk_transform_method=topk_transform_method,
+            attn_metadata=attn_metadata,
+            row_starts=row_starts,
+            batch_idx_list=batch_idx_list,
+        ):
+            from aiter import top_k_per_row_decode
+
+            from sglang.kernels.ops.attention.dsa.transform_index import (
+                transform_index_page_table_decode,
+            )
+
+            logical_topk = torch.empty(
+                (logits.shape[0], topk),
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            top_k_per_row_decode(
+                logits,
+                1,
+                lengths,
+                logical_topk,
+                logits.shape[0],
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+                stable=True,
+            )
+            return transform_index_page_table_decode(
+                page_table=attn_metadata.page_table_1,
+                topk_indices=logical_topk,
+                page_size=1,
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
@@ -267,6 +312,31 @@ class DSATopKBackend(Enum):
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
+
+
+def _can_use_aiter_decode_topk(
+    *,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_transform_method: TopkTransformMethod,
+    attn_metadata,
+    row_starts: Optional[torch.Tensor],
+    batch_idx_list: Optional[List[int]],
+) -> bool:
+    rows, width = logits.shape
+    return (
+        _is_gfx95
+        and not get_spec().speculative_algorithm
+        and topk_transform_method == TopkTransformMethod.PAGED
+        and row_starts is None
+        and batch_idx_list is None
+        and topk == 2048
+        and 0 < rows <= _AITER_DECODE_TOPK_MAX_ROWS
+        and rows == lengths.shape[0]
+        and attn_metadata.page_table_1 is not None
+        and (width <= 20_000 or 32_768 <= width <= 65_535 or width >= 65_536)
+    )
 
 
 def _topk_unfused(

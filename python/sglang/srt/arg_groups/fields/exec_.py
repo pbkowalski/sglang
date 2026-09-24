@@ -279,8 +279,8 @@ class ExecKernel(msgspec.Struct):
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=["sgl-kernel", "torch", "flashinfer"],
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'aiter' (ROCm gfx950 decode with SGL fallback), 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=["sgl-kernel", "aiter", "torch", "flashinfer"],
             resolvable=True,
         ),
     ] = "sgl-kernel"
