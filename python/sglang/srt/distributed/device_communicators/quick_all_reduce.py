@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Any, Union
 
 import torch
 import torch.distributed as dist
@@ -86,6 +86,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._flydsl_int4: Any = None
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -207,7 +208,40 @@ class QuickAllReduce:
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
+        self._flydsl_int4 = self._init_flydsl_int4()
         self.disabled = False
+
+    def _init_flydsl_int4(self) -> Any:
+        if self.qr_quant_level != QuickReduceRegime.INT4:
+            return None
+        if os.environ.get("SGLANG_USE_AITER", "0").lower() not in (
+            "1",
+            "true",
+        ):
+            return None
+        try:
+            from aiter.ops.flydsl import QuickAllReduceInt4
+
+            communicator = QuickAllReduceInt4(
+                group=self.group,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            warmup = torch.empty(MB, dtype=torch.bfloat16, device=self.device)
+            communicator.compile(warmup, torch.empty_like(warmup))
+            torch.cuda.synchronize(self.device)
+        except (ImportError, RuntimeError, ValueError) as error:
+            logger.warning(
+                "AITER FlyDSL INT4 QuickReduce unavailable; using HIP QuickReduce: %s",
+                error,
+            )
+            return None
+        logger.info(
+            "Using AITER FlyDSL INT4 QuickReduce for eligible BF16 payloads; "
+            "other payloads use HIP QuickReduce."
+        )
+        return communicator
 
     def create_shared_buffer(self):
         """
@@ -250,12 +284,27 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._use_flydsl_int4(inp):
+            self._flydsl_int4.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
+    def _use_flydsl_int4(self, inp: torch.Tensor) -> bool:
+        return (
+            self._flydsl_int4 is not None
+            and inp.dtype == torch.bfloat16
+            and inp.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and self.qr_quant_level == QuickReduceRegime.INT4
+        )
+
     def close(self):
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
