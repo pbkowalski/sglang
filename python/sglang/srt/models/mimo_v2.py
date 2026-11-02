@@ -1978,6 +1978,23 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def precompile_kernels_after_loading(self) -> None:
+        target_tp_layers = [
+            layer.mlp
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+            and isinstance(layer.mlp, MiMoV2MoE)
+            and layer.mlp._use_target_mega_moe_tp
+        ]
+        if not target_tp_layers:
+            return
+        from sglang.srt.layers.moe.mimo_mega_moe_tp import (
+            prepare_mimo_mega_moe_tp,
+        )
+
+        for mlp in target_tp_layers:
+            prepare_mimo_mega_moe_tp(mlp)
+
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:
             self.model.load_kv_cache_scales(quantization_param_path)

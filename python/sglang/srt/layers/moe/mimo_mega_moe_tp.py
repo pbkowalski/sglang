@@ -68,6 +68,7 @@ def _get_instance(moe: Any):
     from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 
     _build_weights(moe)
+    torch.cuda.empty_cache()
     parallel = get_parallel()
     cap = _cap()
     key = (
@@ -120,6 +121,10 @@ def _get_instance(moe: Any):
             w2_scale=moe._mega_tp_w2_scale,
         )
     return instance
+
+
+def prepare_mimo_mega_moe_tp(moe: Any) -> None:
+    _get_instance(moe)
 
 
 def forward_mimo_mega_moe_tp(
