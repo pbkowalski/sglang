@@ -158,6 +158,35 @@ def _mimo_megamoe_layer_enabled(layer_id: int) -> bool:
     return False
 
 
+def _is_target_mimo_megamoe_tp_eligible(config, tp_size: int, ep_size: int) -> bool:
+    return (
+        os.getenv("SGLANG_MIMO_MEGA_TP") == "1"
+        and get_platform().is_hip
+        and is_gfx95_supported()
+        and not get_flags().moe.in_speculative_scope
+        and tp_size == 8
+        and ep_size == 8
+        and config.hidden_size == 6144
+        and config.moe_intermediate_size == 2048
+        and config.n_routed_experts == 384
+        and config.num_experts_per_tok == 8
+    )
+
+
+def _mimo_megamoe_tp_layer_enabled(layer_id: int) -> bool:
+    specification = os.getenv("SGLANG_MIMO_MEGA_TP_LAYERS", "")
+    if not specification:
+        return False
+    for item in specification.split(","):
+        if "-" in item:
+            start, stop = (int(value) for value in item.split("-", 1))
+            if start <= layer_id <= stop:
+                return True
+        elif int(item) == layer_id:
+            return True
+    return False
+
+
 def load_mimo_v2_qkv_proj_weight(
     name,
     param,
@@ -463,6 +492,11 @@ class MiMoV2MoE(nn.Module):
             self.tp_size,
             get_parallel().moe_ep_size,
         )
+        self._use_target_mega_moe_tp = _is_target_mimo_megamoe_tp_eligible(
+            config,
+            self.tp_size,
+            get_parallel().moe_ep_size,
+        ) and _mimo_megamoe_tp_layer_enabled(layer_id)
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -585,11 +619,103 @@ class MiMoV2MoE(nn.Module):
     ) -> torch.Tensor:
         return self.gate(hidden_states)
 
+    def _ensure_mega_moe_tp_raw_weights(self) -> None:
+        if hasattr(self, "_mega_tp_w1_raw"):
+            return
+        experts = self.config.n_routed_experts
+        hidden = self.config.hidden_size
+        inter = self.config.moe_intermediate_size // self.tp_size
+        device = self.experts.w13_weight.device
+        self.register_buffer(
+            "_mega_tp_w1_raw",
+            torch.empty(
+                (experts, 2 * inter, hidden // 2),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_mega_tp_w1_scale_raw",
+            torch.empty(
+                (experts, 2 * inter, hidden // 32),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_mega_tp_w2_raw",
+            torch.empty(
+                (experts, hidden, inter // 2),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_mega_tp_w2_scale_raw",
+            torch.empty(
+                (experts, hidden, inter // 32),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self._mega_tp_loaded_weights = set()
+
+    def load_mega_moe_tp_weight(self, name: str, loaded_weight: torch.Tensor) -> None:
+        if not self._use_target_mega_moe_tp or loaded_weight.dtype != torch.uint8:
+            return
+        match = re.search(
+            r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)"
+            r"\.(weight|weight_scale)$",
+            name,
+        )
+        if match is None:
+            return
+        self._ensure_mega_moe_tp_raw_weights()
+        expert = int(match.group(1))
+        projection, kind = match.group(2), match.group(3)
+        inter = self.config.moe_intermediate_size // self.tp_size
+        tp_rank = get_parallel().tp_rank
+        if projection in ("gate_proj", "up_proj"):
+            source = loaded_weight[tp_rank * inter : (tp_rank + 1) * inter]
+            destination = (
+                self._mega_tp_w1_raw if kind == "weight" else self._mega_tp_w1_scale_raw
+            )
+            offset = 0 if projection == "gate_proj" else inter
+            destination[expert, offset : offset + inter].copy_(source)
+        elif kind == "weight":
+            packed = inter // 2
+            self._mega_tp_w2_raw[expert].copy_(
+                loaded_weight[:, tp_rank * packed : (tp_rank + 1) * packed]
+            )
+        else:
+            scales = inter // 32
+            self._mega_tp_w2_scale_raw[expert].copy_(
+                loaded_weight[:, tp_rank * scales : (tp_rank + 1) * scales]
+            )
+        self._mega_tp_loaded_weights.add((expert, projection, kind))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor | MoeDeferredFinalize:
+        if (
+            self._use_target_mega_moe_tp
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.layers.moe.mimo_mega_moe_tp import (
+                forward_mimo_mega_moe_tp,
+                should_use_mimo_mega_moe_tp,
+            )
+
+            if should_use_mimo_mega_moe_tp(self, hidden_states):
+                return forward_mimo_mega_moe_tp(self, hidden_states, forward_batch)
+
         if (
             self._use_target_mega_moe
             and _mimo_megamoe_layer_enabled(self.layer_id)
@@ -1724,6 +1850,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     skipped_mtp_weights = True
                 continue
+
+            if (
+                layer_id is not None
+                and ".mlp.experts." in name
+                and not isinstance(self.model.layers[layer_id], PPMissingLayer)
+            ):
+                mlp = self.model.layers[layer_id].mlp
+                if isinstance(mlp, MiMoV2MoE):
+                    mlp.load_mega_moe_tp_weight(name, loaded_weight)
 
             if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
                 if name.endswith(".weight_scale"):

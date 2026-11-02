@@ -87,6 +87,42 @@ def test_mimo_megamoe_layer_allowlist(monkeypatch, specification, layer_id, expe
     assert mimo_v2._mimo_megamoe_layer_enabled(layer_id) is expected
 
 
+def test_mimo_megamoe_tp_checkpoint_slices(monkeypatch):
+    moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
+    nn.Module.__init__(moe)
+    moe.config = SimpleNamespace(
+        hidden_size=64,
+        moe_intermediate_size=64,
+        n_routed_experts=4,
+    )
+    moe.tp_size = 2
+    moe.experts = SimpleNamespace(w13_weight=torch.empty(0))
+    moe._use_target_mega_moe_tp = True
+    monkeypatch.setattr(
+        mimo_v2,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=1),
+    )
+
+    gate = torch.arange(64 * 32, dtype=torch.int64).to(torch.uint8).view(64, 32)
+    up = gate.add(7)
+    gate_scale = torch.arange(64 * 2, dtype=torch.int64).to(torch.uint8).view(64, 2)
+    down = torch.arange(64 * 32, dtype=torch.int64).to(torch.uint8).view(64, 32)
+    down_scale = torch.arange(64 * 2, dtype=torch.int64).to(torch.uint8).view(64, 2)
+    prefix = "model.layers.1.mlp.experts.2"
+    moe.load_mega_moe_tp_weight(f"{prefix}.gate_proj.weight", gate)
+    moe.load_mega_moe_tp_weight(f"{prefix}.up_proj.weight", up)
+    moe.load_mega_moe_tp_weight(f"{prefix}.gate_proj.weight_scale", gate_scale)
+    moe.load_mega_moe_tp_weight(f"{prefix}.down_proj.weight", down)
+    moe.load_mega_moe_tp_weight(f"{prefix}.down_proj.weight_scale", down_scale)
+
+    assert torch.equal(moe._mega_tp_w1_raw[2, :32], gate[32:64])
+    assert torch.equal(moe._mega_tp_w1_raw[2, 32:64], up[32:64])
+    assert torch.equal(moe._mega_tp_w1_scale_raw[2, :32], gate_scale[32:64])
+    assert torch.equal(moe._mega_tp_w2_raw[2], down[:, 16:32])
+    assert torch.equal(moe._mega_tp_w2_scale_raw[2], down_scale[:, 1:2])
+
+
 def test_mimo_megamoe_caller_preserves_normal_fallback(monkeypatch):
     moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
     nn.Module.__init__(moe)
