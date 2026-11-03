@@ -24,9 +24,12 @@ def _cap() -> int:
 
 
 def should_use_mimo_mega_moe_tp(moe: Any, hidden_states: torch.Tensor) -> bool:
+    parallel = get_parallel()
     return (
         len(getattr(moe, "_mega_tp_loaded_weights", ())) == _EXPECTED_CHECKPOINT_WEIGHTS
         and _rank_consistent_max_tokens(hidden_states) <= _cap()
+        and hidden_states.shape[0] % parallel.tp_size == 0
+        and parallel.tp_group.ranks == parallel.moe_ep_group.ranks
     )
 
 
@@ -139,4 +142,4 @@ def forward_mimo_mega_moe_tp(
         topk_output.topk_weights.to(torch.float32).contiguous(),
         topk_output.topk_ids.to(torch.int32).contiguous(),
     )
-    return output.mul(1.0 / get_parallel().moe_ep_size)
+    return output

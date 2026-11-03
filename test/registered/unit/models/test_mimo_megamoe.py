@@ -123,6 +123,47 @@ def test_mimo_megamoe_tp_checkpoint_slices(monkeypatch):
     assert torch.equal(moe._mega_tp_w2_scale_raw[2], down_scale[:, 1:2])
 
 
+def test_mimo_megamoe_tp_bypasses_ffn_reduction():
+    class Attention(nn.Module):
+        def forward(self, **kwargs):
+            return kwargs["hidden_states"]
+
+    class Boundary:
+        def __init__(self):
+            self.already_reduced = None
+
+        def prepare(self, hidden_states, forward_batch, **kwargs):
+            return hidden_states
+
+        def finish(self, hidden_states, forward_batch):
+            return hidden_states
+
+        def complete_now(self, hidden_states, forward_batch, *, already_reduced=False):
+            self.already_reduced = already_reduced
+            return hidden_states
+
+    layer = mimo_v2.MiMoV2DecoderLayer.__new__(mimo_v2.MiMoV2DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.attn_boundary = Boundary()
+    layer.ffn_boundary = Boundary()
+    layer.self_attn = Attention()
+    moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
+    nn.Module.__init__(moe)
+    moe.should_use_target_mega_moe_tp = lambda hidden_states, forward_batch: True
+    expected = torch.ones(2, 3)
+    moe.forward_target_mega_moe_tp = lambda hidden_states, forward_batch: expected
+    layer.mlp = moe
+
+    actual = layer.forward(
+        positions=torch.zeros(2, dtype=torch.long),
+        hidden_states=torch.zeros(2, 3),
+        forward_batch=SimpleNamespace(),
+    )
+
+    assert actual is expected
+    assert layer.ffn_boundary.already_reduced is True
+
+
 def test_mimo_megamoe_caller_preserves_normal_fallback(monkeypatch):
     moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
     nn.Module.__init__(moe)

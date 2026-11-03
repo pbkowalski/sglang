@@ -135,6 +135,7 @@ def _is_target_mimo_megamoe_eligible(config, tp_size: int, ep_size: int) -> bool
         and not get_flags().moe.in_speculative_scope
         and tp_size == 8
         and ep_size == 8
+        and get_exec().moe.ep_num_redundant_experts == 0
         and config.hidden_size == 6144
         and config.moe_intermediate_size == 2048
         and config.n_routed_experts == 384
@@ -166,6 +167,7 @@ def _is_target_mimo_megamoe_tp_eligible(config, tp_size: int, ep_size: int) -> b
         and not get_flags().moe.in_speculative_scope
         and tp_size == 8
         and ep_size == 8
+        and get_exec().moe.ep_num_redundant_experts == 0
         and config.hidden_size == 6144
         and config.moe_intermediate_size == 2048
         and config.n_routed_experts == 384
@@ -698,24 +700,39 @@ class MiMoV2MoE(nn.Module):
             )
         self._mega_tp_loaded_weights.add((expert, projection, kind))
 
+    def should_use_target_mega_moe_tp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> bool:
+        if (
+            not self._use_target_mega_moe_tp
+            or forward_batch is None
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+        from sglang.srt.layers.moe.mimo_mega_moe_tp import (
+            should_use_mimo_mega_moe_tp,
+        )
+
+        return should_use_mimo_mega_moe_tp(self, hidden_states)
+
+    def forward_target_mega_moe_tp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mimo_mega_moe_tp import (
+            forward_mimo_mega_moe_tp,
+        )
+
+        return forward_mimo_mega_moe_tp(self, hidden_states, forward_batch)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor | MoeDeferredFinalize:
-        if (
-            self._use_target_mega_moe_tp
-            and forward_batch is not None
-            and forward_batch.forward_mode.is_target_verify()
-        ):
-            from sglang.srt.layers.moe.mimo_mega_moe_tp import (
-                forward_mimo_mega_moe_tp,
-                should_use_mimo_mega_moe_tp,
-            )
-
-            if should_use_mimo_mega_moe_tp(self, hidden_states):
-                return forward_mimo_mega_moe_tp(self, hidden_states, forward_batch)
-
         if (
             self._use_target_mega_moe
             and _mimo_megamoe_layer_enabled(self.layer_id)
@@ -1186,6 +1203,16 @@ class MiMoV2DecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        if isinstance(self.mlp, MiMoV2MoE) and self.mlp.should_use_target_mega_moe_tp(
+            hidden_states, forward_batch
+        ):
+            hidden_states = self.mlp.forward_target_mega_moe_tp(
+                hidden_states, forward_batch
+            )
+            return self.ffn_boundary.complete_now(
+                hidden_states, forward_batch, already_reduced=True
+            )
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
