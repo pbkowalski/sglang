@@ -40,6 +40,17 @@ def _build_weights(moe: Any) -> None:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility import fp4_utils
 
+    device = torch.device("cuda", torch.cuda.current_device())
+    for name in (
+        "_mega_tp_w1_raw",
+        "_mega_tp_w1_scale_raw",
+        "_mega_tp_w2_raw",
+        "_mega_tp_w2_scale_raw",
+    ):
+        tensor = getattr(moe, name)
+        if tensor.device != device:
+            setattr(moe, name, tensor.to(device=device, non_blocking=False))
+
     experts = moe.config.n_routed_experts
     inter = moe.config.moe_intermediate_size // moe.tp_size
     hidden = moe.config.hidden_size
@@ -106,7 +117,7 @@ def _get_instance(moe: Any):
             w1_scale=moe._mega_tp_w1_scale,
             w2=moe._mega_tp_w2,
             w2_scale=moe._mega_tp_w2_scale,
-            group=parallel.tp_group.device_group,
+            group=None,
             device=moe._mega_tp_w1.device,
         )
         buckets = [
@@ -137,9 +148,11 @@ def forward_mimo_mega_moe_tp(
 ) -> torch.Tensor:
     router_logits = moe._mega_moe_router_logits(hidden_states, forward_batch)
     topk_output = moe.topk(hidden_states, router_logits)
+    output_buffer = torch.empty_like(hidden_states)
     output = _get_instance(moe)(
         hidden_states.contiguous(),
         topk_output.topk_weights.to(torch.float32).contiguous(),
         topk_output.topk_ids.to(torch.int32).contiguous(),
+        out=output_buffer,
     )
     return output
