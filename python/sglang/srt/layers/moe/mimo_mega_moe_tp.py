@@ -81,8 +81,11 @@ def _get_instance(moe: Any):
     from aiter import ActivationType
     from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 
+    needs_weight_build = not hasattr(moe, "_mega_tp_w1")
     _build_weights(moe)
-    torch.cuda.empty_cache()
+    if needs_weight_build:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     parallel = get_parallel()
     cap = _cap()
     key = (
@@ -120,11 +123,7 @@ def _get_instance(moe: Any):
             group=None,
             device=moe._mega_tp_w1.device,
         )
-        buckets = [
-            math.ceil(tokens / parallel.tp_size)
-            for tokens in (32, 64, 128)
-            if tokens <= cap
-        ]
+        buckets = list(range(1, math.ceil(cap / parallel.tp_size) + 1))
         instance.prepare(buckets)
         _MEGA_TP_INSTANCE[key] = instance
     else:
@@ -149,6 +148,8 @@ def forward_mimo_mega_moe_tp(
     router_logits = moe._mega_moe_router_logits(hidden_states, forward_batch)
     topk_output = moe.topk(hidden_states, router_logits)
     output_buffer = torch.empty_like(hidden_states)
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
     output = _get_instance(moe)(
         hidden_states.contiguous(),
         topk_output.topk_weights.to(torch.float32).contiguous(),
